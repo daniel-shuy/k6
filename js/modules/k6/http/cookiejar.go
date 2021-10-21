@@ -40,6 +40,12 @@ type HTTPCookieJar struct {
 	ctx *context.Context
 }
 
+// GetJarFromHTTPCookieJar is a helper function for modules outside of http to get the jar from inside the cookie jar
+// TODO figure out how to do this through only goja
+func GetJarFromHTTPCookieJar(jar *HTTPCookieJar) *cookiejar.Jar {
+	return jar.jar // binks
+}
+
 func newCookieJar(ctxPtr *context.Context) *HTTPCookieJar {
 	jar, err := cookiejar.New(nil)
 	if err != nil {

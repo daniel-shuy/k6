@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"strconv"
 	"testing"
@@ -38,6 +39,7 @@ import (
 	"gopkg.in/guregu/null.v3"
 
 	"go.k6.io/k6/js/common"
+	httpModule "go.k6.io/k6/js/modules/k6/http"
 	"go.k6.io/k6/lib"
 	"go.k6.io/k6/lib/metrics"
 	"go.k6.io/k6/lib/testutils/httpmultibin"
@@ -91,7 +93,7 @@ func assertMetricEmittedCount(t *testing.T, metricName string, sampleContainers 
 	assert.Equal(t, count, actualCount, "url %s emitted %s %d times, expected was %d times", url, metricName, actualCount, count)
 }
 
-func newRuntime(t testing.TB) (*httpmultibin.HTTPMultiBin, chan stats.SampleContainer, *goja.Runtime) {
+func newRuntime(t testing.TB) (*httpmultibin.HTTPMultiBin, chan stats.SampleContainer, *goja.Runtime, *context.Context) {
 	tb := httpmultibin.NewHTTPMultiBin(t)
 
 	root, err := lib.NewGroup("", nil)
@@ -125,7 +127,7 @@ func newRuntime(t testing.TB) (*httpmultibin.HTTPMultiBin, chan stats.SampleCont
 	err = rt.Set("ws", common.Bind(rt, New(), ctx))
 	assert.NoError(t, err)
 
-	return tb, samples, rt
+	return tb, samples, rt, ctx
 }
 
 func TestSession(t *testing.T) {
@@ -982,7 +984,7 @@ func TestCompression(t *testing.T) {
 		t.Parallel()
 		const text string = `Lorem ipsum dolor sit amet, consectetur adipiscing elit. Maecenas sed pharetra sapien. Nunc laoreet molestie ante ac gravida. Etiam interdum dui viverra posuere egestas. Pellentesque at dolor tristique, mattis turpis eget, commodo purus. Nunc orci aliquam.`
 
-		tb, samples, rt := newRuntime(t)
+		tb, samples, rt, _ := newRuntime(t)
 		sr := tb.Replacer.Replace
 		tb.Mux.HandleFunc("/ws-compression", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			upgrader := websocket.Upgrader{
@@ -1070,7 +1072,7 @@ func TestCompression(t *testing.T) {
 			testCase := testCase
 			t.Run(testCase.compression, func(t *testing.T) {
 				t.Parallel()
-				tb, _, rt := newRuntime(t)
+				tb, _, rt, _ := newRuntime(t)
 				sr := tb.Replacer.Replace
 				tb.Mux.HandleFunc("/ws-compression-param", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 					upgrader := websocket.Upgrader{
@@ -1122,7 +1124,7 @@ func clearSamples(tb *httpmultibin.HTTPMultiBin, samples chan stats.SampleContai
 
 func BenchmarkCompression(b *testing.B) {
 	const textMessage = 1
-	tb, samples, rt := newRuntime(b)
+	tb, samples, rt, _ := newRuntime(b)
 	sr := tb.Replacer.Replace
 	go clearSamples(tb, samples)
 
@@ -1187,4 +1189,65 @@ func BenchmarkCompression(b *testing.B) {
 			}
 		}
 	})
+}
+
+func TestCookieJar(t *testing.T) {
+	t.Parallel()
+	tb, samples, rt, ctxPtr := newRuntime(t)
+	sr := tb.Replacer.Replace
+
+	tb.Mux.HandleFunc("/ws-echo-someheader", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		responseHeaders := w.Header().Clone()
+		if sh, err := req.Cookie("someheader"); err == nil {
+			responseHeaders.Add("Echo-Someheader", sh.Value)
+		}
+
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, req, responseHeaders)
+		if err != nil {
+			t.Fatalf("/ws-echo-someheader cannot upgrade request: %v", err)
+			return
+		}
+
+		err = conn.Close()
+		if err != nil {
+			t.Logf("error while closing connection in /ws-echo-someheader: %v", err)
+			return
+		}
+	}))
+	err := rt.Set("http", common.Bind(rt, httpModule.New().NewModuleInstancePerVU(), ctxPtr))
+	require.NoError(t, err)
+	state := lib.GetState(*ctxPtr)
+	state.CookieJar, _ = cookiejar.New(nil)
+
+	_, err = rt.RunString(sr(`
+		var res = ws.connect("WSBIN_URL/ws-echo-someheader", function(socket){
+			socket.close()
+		})
+		var someheader = res.headers["Echo-Someheader"];
+		if (someheader != undefined) {
+			throw new Error("somehader is echoed back by test server even though it doesn't exist");
+		}
+
+		http.cookieJar().set("HTTPBIN_URL/ws-echo-someheader", "someheader", "defaultjar")
+		res = ws.connect("WSBIN_URL/ws-echo-someheader", function(socket){
+			socket.close()
+		})
+		someheader = res.headers["Echo-Someheader"];
+		if (someheader != "defaultjar") {
+			throw new Error("someheader has wrong value "+ someheader + " instead of defaultjar");
+		}
+
+		var jar = new http.CookieJar();
+		jar.set("HTTPBIN_URL/ws-echo-someheader", "someheader", "customjar")
+		res = ws.connect("WSBIN_URL/ws-echo-someheader", {jar: jar}, function(socket){
+			socket.close()
+		})
+		someheader = res.headers["Echo-Someheader"];
+		if (someheader != "customjar") {
+			throw new Error("someheader has wrong value "+ someheader + " instead of customjar");
+		}
+		`))
+	assert.NoError(t, err)
+
+	assertSessionMetricsEmitted(t, stats.GetBufferedSamples(samples), "", sr("WSBIN_URL/ws-echo-someheader"), statusProtocolSwitch, "")
 }
